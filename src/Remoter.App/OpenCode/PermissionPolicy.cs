@@ -33,6 +33,37 @@ public static class PermissionPolicy
         new("read", "*.env.*", "ask"),
     ];
 
+    /// <summary>
+    /// Всё разрешено без единого вопроса. Единственное исключение — инструмент
+    /// question: Telegram не умеет показывать его формы, поэтому агент спрашивает
+    /// обычным текстом.
+    /// </summary>
+    public static PermissionRule[] AllowAll() =>
+    [
+        new("*", "*", "allow"),
+        new("question", "*", "deny"),
+    ];
+
+    /// <summary>Правила для сессии с учётом режима подтверждений.</summary>
+    public static PermissionRule[] For(bool autoApprove) =>
+        autoApprove ? AllowAll() : Default();
+
+    /// <summary>Совпадает ли текущий набор правил сессии с желаемым.</summary>
+    public static bool AreEqual(IReadOnlyList<PermissionRule>? current, IReadOnlyList<PermissionRule> desired)
+    {
+        if (current is null || current.Count != desired.Count) return false;
+
+        for (var i = 0; i < current.Count; i++)
+        {
+            if (!string.Equals(current[i].Action, desired[i].Action, StringComparison.Ordinal)
+                || !string.Equals(current[i].Resource, desired[i].Resource, StringComparison.Ordinal)
+                || !string.Equals(current[i].Effect, desired[i].Effect, StringComparison.Ordinal))
+                return false;
+        }
+
+        return true;
+    }
+
     public static string Describe(string action) => action switch
     {
         "shell" => "🖥 Команда в терминале",

@@ -54,4 +54,27 @@ public class AppConfigTests
 
         Assert.True(config.PreventSleep);
     }
+
+    [Theory]
+    [InlineData("true", true)]
+    [InlineData("1", true)]
+    [InlineData("false", false)]
+    public void ApplySetting_ParsesAutoApprove(string value, bool expected)
+    {
+        var config = new AppConfig();
+
+        config.ApplySetting("AUTO_APPROVE", value);
+
+        Assert.Equal(expected, config.AutoApprove);
+    }
+
+    [Fact]
+    public void ApplySetting_AutoApproveHasNoApprovalAlias()
+    {
+        var config = new AppConfig();
+
+        config.ApplySetting("NO_APPROVAL", "true");
+
+        Assert.True(config.AutoApprove);
+    }
 }

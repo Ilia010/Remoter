@@ -106,8 +106,9 @@ public sealed class BotService
             await Task.Delay(1500, ct).ConfigureAwait(false);
             var text = "🟢 <b>Remoter запущен</b>\n" +
                        $"📁 {TextUtil.EscapeHtml(_config.DefaultDirectory)}\n" +
-                       $"🧠 {TextUtil.EscapeHtml(_config.Model.ProviderID + "/" + _config.Model.ID)}\n\n" +
-                       "Пиши задачу обычным текстом. /help — команды.";
+                       $"🧠 {TextUtil.EscapeHtml(_config.Model.ProviderID + "/" + _config.Model.ID)}\n" +
+                       (_config.AutoApprove ? "🔓 Подтверждения отключены\n" : "") +
+                       "\nПиши задачу обычным текстом. /help — команды.";
             await _sender!.SendHtmlAsync(Cid(_config.AllowedUserIds[0]), text, null, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
@@ -307,6 +308,22 @@ public sealed class BotService
                 var existing = await _client.GetSessionAsync(chat.SessionID, ct).ConfigureAwait(false);
                 if (existing is not null)
                 {
+                    // Настройки могли измениться (например, включили AUTO_APPROVE) —
+                    // применяем актуальные права к уже существующей сессии.
+                    var desired = PermissionPolicy.For(_config.AutoApprove);
+                    if (!PermissionPolicy.AreEqual(existing.Permissions, desired))
+                    {
+                        try
+                        {
+                            await _client.UpdatePermissionsAsync(existing.Id, desired, ct).ConfigureAwait(false);
+                            Log.Info($"Права сессии {existing.Id} обновлены: {desired.Length} правил");
+                        }
+                        catch (Exception ex)
+                        {
+                            Log.Warn($"Не удалось обновить права сессии {existing.Id}: {ex.Message}");
+                        }
+                    }
+
                     runtime.SessionId = existing.Id;
                     MapSession(existing.Id, runtime.ChatId);
                     return existing.Id;
@@ -331,7 +348,7 @@ public sealed class BotService
 
         var agent = chat.Agent ?? _config.Agent;
         var session = await _client
-            .CreateSessionAsync(directory, PermissionPolicy.Default(), agent, model, "Telegram", ct)
+            .CreateSessionAsync(directory, PermissionPolicy.For(_config.AutoApprove), agent, model, "Telegram", ct)
             .ConfigureAwait(false);
 
         _state.Update(runtime.ChatId, s =>
@@ -810,7 +827,10 @@ public sealed class BotService
             $"📁 Папка: <code>{TextUtil.EscapeHtml(chat.Directory ?? _config.DefaultDirectory)}</code>\n" +
             $"🧠 Модель: <code>{TextUtil.EscapeHtml((chat.ModelProvider ?? _config.Model.ProviderID) + "/" + (chat.ModelID ?? _config.Model.ID))}</code>\n" +
             $"🤖 Агент: <code>{TextUtil.EscapeHtml(chat.Agent ?? _config.Agent)}</code>\n\n" +
-            "Напиши задачу обычным текстом. Опасные действия придут с кнопками.\n" +
+            "Напиши задачу обычным текстом. " +
+            (_config.AutoApprove
+                ? "Подтверждения отключены — всё выполняется сразу.\n"
+                : "Опасные действия придут с кнопками.\n") +
             "/help — все команды.";
 
         await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, null, ct).ConfigureAwait(false);
@@ -818,10 +838,18 @@ public sealed class BotService
 
     private async Task CmdHelpAsync(ChatRuntime runtime, CancellationToken ct)
     {
-        const string text =
+        var approvalLine = _config.AutoApprove
+            ? "Подтверждения отключены: правки, команды и сеть выполняются сразу."
+            : "Правки файлов, команды в терминале и сеть требуют подтверждения кнопкой.";
+
+        var footer = _config.AutoApprove
+            ? "<i>Чтение и изменения выполняются без спроса. Бот слушает только твой ID.</i>"
+            : "<i>Чтение файлов разрешено без спроса. Всё, что меняет систему, — только с кнопкой.</i>";
+
+        var text =
             "<b>Remoter</b> — мост к OpenCode на этом ПК.\n\n" +
             "Просто напиши задачу: агент прочитает код, что-то поменяет и запустит.\n" +
-            "Правки файлов, команды в терминале и сеть требуют подтверждения кнопкой.\n\n" +
+            approvalLine + "\n\n" +
             "<b>Команды</b>\n" +
             "/new [путь] — новая сессия\n" +
             "/sessions — последние сессии\n" +
@@ -835,8 +863,7 @@ public sealed class BotService
             "/ls [путь] — содержимое папки\n" +
             "/diff — изменения текущей сессии\n" +
             "/restart — перезапуск сервиса OpenCode\n" +
-            "/shutdown — выключить бота\n\n" +
-            "<i>Чтение файлов разрешено без спроса. Всё, что меняет систему, — только с кнопкой.</i>";
+            "/shutdown — выключить бота\n\n" + footer;
 
         await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, null, ct).ConfigureAwait(false);
     }
@@ -863,7 +890,7 @@ public sealed class BotService
         var agent = chat.Agent ?? _config.Agent;
 
         var session = await _client
-            .CreateSessionAsync(directory, PermissionPolicy.Default(), agent, model, "Telegram", ct)
+            .CreateSessionAsync(directory, PermissionPolicy.For(_config.AutoApprove), agent, model, "Telegram", ct)
             .ConfigureAwait(false);
 
         _state.Update(runtime.ChatId, s =>

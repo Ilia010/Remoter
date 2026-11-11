@@ -25,6 +25,9 @@ public sealed class AppConfig
 
     public bool AutoStartOpenCodeService { get; set; } = true;
     public bool PreventSleep { get; set; }
+
+    /// <summary>Не спрашивать подтверждений: все действия выполняются сразу.</summary>
+    public bool AutoApprove { get; set; }
     public string OpenCodeCommand { get; set; } = "opencode.cmd";
     public string ServiceStatePath { get; set; } = "";
     public int OpenCodeStartTimeoutSeconds { get; set; } = 90;
@@ -141,6 +144,8 @@ public sealed class AppConfig
                 && !key.StartsWith("APPROVAL_", StringComparison.OrdinalIgnoreCase)
                 && !key.StartsWith("AUTO_START", StringComparison.OrdinalIgnoreCase)
                 && !key.StartsWith("PREVENT_", StringComparison.OrdinalIgnoreCase)
+                && !key.StartsWith("AUTO_APPROVE", StringComparison.OrdinalIgnoreCase)
+                && !key.StartsWith("NO_APPROVAL", StringComparison.OrdinalIgnoreCase)
                 && !key.StartsWith("OPENCODE_", StringComparison.OrdinalIgnoreCase))
                 continue;
 
@@ -196,6 +201,10 @@ public sealed class AppConfig
             case "PREVENT_SLEEP":
             case "KEEP_AWAKE":
                 PreventSleep = IsTrue(value);
+                break;
+            case "AUTO_APPROVE":
+            case "NO_APPROVAL":
+                AutoApprove = IsTrue(value);
                 break;
             case "OPENCODE_COMMAND":
                 OpenCodeCommand = value;

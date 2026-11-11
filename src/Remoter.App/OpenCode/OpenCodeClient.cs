@@ -212,6 +212,16 @@ public sealed class OpenCodeClient : IAsyncDisposable
 
     // ---------- permissions ----------
 
+    public async Task UpdatePermissionsAsync(
+        string sessionId, IEnumerable<PermissionRule> permissions, CancellationToken ct)
+    {
+        await SendAsync(
+            HttpMethod.Patch,
+            $"/api/session/{Uri.EscapeDataString(sessionId)}",
+            new { permissions = permissions.ToArray() },
+            ct).ConfigureAwait(false);
+    }
+
     public async Task<IReadOnlyList<PermissionRequest>> ListPermissionsAsync(string sessionId, CancellationToken ct)
     {
         var json = await SendAsync(

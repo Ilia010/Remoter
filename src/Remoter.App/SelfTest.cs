@@ -32,7 +32,7 @@ public static class SelfTest
             // Проверяем, что реальный набор правил (camelCase) принимается сервисом.
             var policySession = await client.CreateSessionAsync(
                 directory,
-                PermissionPolicy.Default(),
+                PermissionPolicy.For(config.AutoApprove),
                 "build",
                 new ModelRef { Id = config.Model.ID, ProviderID = config.Model.ProviderID },
                 "remoter-policy-check",
@@ -54,7 +54,7 @@ public static class SelfTest
             // обращения к модели, и проверка показывает несуществующую проблему.
             var session = await client.CreateSessionAsync(
                 directory,
-                PermissionPolicy.Default(),
+                PermissionPolicy.For(config.AutoApprove),
                 "build",
                 new ModelRef { Id = config.Model.ID, ProviderID = config.Model.ProviderID },
                 "remoter-selftest",
