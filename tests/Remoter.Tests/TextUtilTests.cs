@@ -87,9 +87,21 @@ public class TextUtilTests
     [Fact]
     public void HumanBytes_UsesBinaryUnits()
     {
-        Assert.Equal("512 Б", TextUtil.HumanBytes(512));
-        Assert.Equal("1 КБ", TextUtil.HumanBytes(1024));
-        Assert.Equal("1,5 МБ", TextUtil.HumanBytes((long)(1.5 * 1024 * 1024)));
+        var previous = System.Globalization.CultureInfo.CurrentCulture;
+        try
+        {
+            // Форматирование зависит от культуры (десятичная запятая), поэтому
+            // фиксируем её — иначе тест падает на англоязычных машинах и в CI.
+            System.Globalization.CultureInfo.CurrentCulture = new System.Globalization.CultureInfo("ru-RU");
+
+            Assert.Equal("512 Б", TextUtil.HumanBytes(512));
+            Assert.Equal("1 КБ", TextUtil.HumanBytes(1024));
+            Assert.Equal("1,5 МБ", TextUtil.HumanBytes((long)(1.5 * 1024 * 1024)));
+        }
+        finally
+        {
+            System.Globalization.CultureInfo.CurrentCulture = previous;
+        }
     }
 
     [Fact]
