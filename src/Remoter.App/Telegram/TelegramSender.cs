@@ -13,6 +13,7 @@ public sealed class TelegramSender
     private readonly ITelegramBotClient _bot;
     private readonly AppConfig _config;
     private readonly SemaphoreSlim _sendGate = new(1, 1);
+    private readonly SemaphoreSlim _mediaGate = new(1, 1);
     private readonly SemaphoreSlim _editGate = new(1, 1);
     private readonly Dictionary<long, DateTime> _lastEdit = new();
     private readonly object _sync = new();
@@ -218,7 +219,7 @@ public sealed class TelegramSender
 
     public async Task SendPhotoAsync(ChatId chatId, string path, string caption, CancellationToken ct)
     {
-        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        await _mediaGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             await using var stream = File.OpenRead(path);
@@ -231,13 +232,13 @@ public sealed class TelegramSender
         }
         finally
         {
-            _sendGate.Release();
+            _mediaGate.Release();
         }
     }
 
     public async Task SendDocumentAsync(ChatId chatId, string path, string caption, CancellationToken ct)
     {
-        await _sendGate.WaitAsync(ct).ConfigureAwait(false);
+        await _mediaGate.WaitAsync(ct).ConfigureAwait(false);
         try
         {
             await using var stream = File.OpenRead(path);
@@ -250,7 +251,20 @@ public sealed class TelegramSender
         }
         finally
         {
-            _sendGate.Release();
+            _mediaGate.Release();
+        }
+    }
+
+    /// <summary>Индикатор «печатает…» — не блокирует остальные отправки.</summary>
+    public async Task SendTypingAsync(ChatId chatId, ChatAction action, CancellationToken ct)
+    {
+        try
+        {
+            await _bot.SendChatAction(chatId, action, cancellationToken: ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"SendChatAction: {ex.Message}");
         }
     }
 

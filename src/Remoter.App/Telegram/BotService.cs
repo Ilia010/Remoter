@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using Remoter.App.Features;
 using Remoter.App.OpenCode;
 using Remoter.App.Storage;
@@ -16,6 +17,13 @@ namespace Remoter.App.Telegram;
 
 public sealed class ChatRuntime
 {
+    private readonly Dictionary<int, List<SessionInfo>> _sessionLists = new();
+    private readonly object _sessionSync = new();
+
+    // Токены живут только в памяти; случайный старт не даёт старым кнопкам
+    // после перезапуска совпасть с новым списком сессий.
+    private int _sessionToken = Random.Shared.Next(1, 1_000_000);
+
     public ChatRuntime(long chatId) => ChatId = chatId;
 
     public long ChatId { get; }
@@ -28,6 +36,24 @@ public sealed class ChatRuntime
     public string? SessionId;
     public List<SessionInfo>? LastSessions;
     public List<ModelInfo>? LastModels;
+    public FileBrowser Browser { get; } = new();
+
+    public int StoreSessions(List<SessionInfo> sessions)
+    {
+        lock (_sessionSync)
+        {
+            var token = ++_sessionToken;
+            _sessionLists[token] = sessions;
+            while (_sessionLists.Count > 5)
+                _sessionLists.Remove(_sessionLists.Keys.Min());
+            return token;
+        }
+    }
+
+    public bool TryGetSessions(int token, out List<SessionInfo> sessions)
+    {
+        lock (_sessionSync) return _sessionLists.TryGetValue(token, out sessions!);
+    }
 }
 
 public sealed class BotService
@@ -40,6 +66,7 @@ public sealed class BotService
     private readonly ConcurrentDictionary<long, ChatRuntime> _chats = new();
     private readonly ConcurrentDictionary<string, long> _sessionChats = new();
     private readonly ConcurrentDictionary<string, byte> _seenPermissions = new();
+    private readonly ConcurrentDictionary<long, ChatInbox> _inboxes = new();
 
     private ITelegramBotClient? _bot;
     private TelegramSender? _sender;
@@ -78,8 +105,11 @@ public sealed class BotService
             Log.Warn($"DeleteWebhook: {ex.Message}");
         }
 
+        await RegisterCommandsAsync(ct).ConfigureAwait(false);
+
         _ = Task.Run(() => EventLoopAsync(ct), ct);
         _ = Task.Run(() => StartupNoticeAsync(ct), ct);
+        _ = Task.Run(() => WarmUpAsync(ct), ct);
 
         var receiver = new ReceiverOptions
         {
@@ -108,8 +138,10 @@ public sealed class BotService
                        $"📁 {TextUtil.EscapeHtml(_config.DefaultDirectory)}\n" +
                        $"🧠 {TextUtil.EscapeHtml(_config.Model.ProviderID + "/" + _config.Model.ID)}\n" +
                        (_config.AutoApprove ? "🔓 Подтверждения отключены\n" : "") +
-                       "\nПиши задачу обычным текстом. /help — команды.";
-            await _sender!.SendHtmlAsync(Cid(_config.AllowedUserIds[0]), text, null, ct).ConfigureAwait(false);
+                       "\nПиши задачу обычным текстом или выбирай действия кнопками.";
+            await _sender!
+                .SendHtmlAsync(Cid(_config.AllowedUserIds[0]), text, BotMenus.ReplyMenu(), ct)
+                .ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -120,36 +152,126 @@ public sealed class BotService
         }
     }
 
-    // ---------- updates ----------
-
-    private async Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
+    private async Task RegisterCommandsAsync(CancellationToken ct)
     {
         try
         {
-            if (update.Type == UpdateType.Message && update.Message is { } message)
-                await OnMessageAsync(message, ct).ConfigureAwait(false);
-            else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery is { } callback)
-                await OnCallbackAsync(callback, ct).ConfigureAwait(false);
+            await _bot!.SetMyCommands(
+            [
+                new BotCommand { Command = "start", Description = "Приветствие и меню" },
+                new BotCommand { Command = "menu", Description = "Меню с кнопками" },
+                new BotCommand { Command = "new", Description = "Новая сессия и выбор папки" },
+                new BotCommand { Command = "ls", Description = "Файлы и папки" },
+                new BotCommand { Command = "sessions", Description = "Последние сессии" },
+                new BotCommand { Command = "use", Description = "Переключить сессию по номеру" },
+                new BotCommand { Command = "model", Description = "Выбрать модель" },
+                new BotCommand { Command = "agent", Description = "Режим агента" },
+                new BotCommand { Command = "status", Description = "Статус и очередь" },
+                new BotCommand { Command = "cancel", Description = "Прервать задачу" },
+                new BotCommand { Command = "screen", Description = "Скриншот экрана" },
+                new BotCommand { Command = "file", Description = "Прислать файл по пути" },
+                new BotCommand { Command = "diff", Description = "Изменения сессии" },
+                new BotCommand { Command = "restart", Description = "Перезапустить OpenCode" },
+                new BotCommand { Command = "id", Description = "Мой Telegram ID" },
+                new BotCommand { Command = "help", Description = "Справка" },
+            ], cancellationToken: ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Не удалось обновить список команд: {ex.Message}");
+        }
+    }
+
+    /// <summary>Заранее поднимаем OpenCode, чтобы первый запрос не ждал холодного старта.</summary>
+    private async Task WarmUpAsync(CancellationToken ct)
+    {
+        try
+        {
+            await _client.EnsureServiceAsync(ct).ConfigureAwait(false);
+            Log.Info("OpenCode прогрет и готов принимать запросы");
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
         }
         catch (Exception ex)
         {
-            Log.Error($"Ошибка обработки {update.Type}", ex);
-            var chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id;
-            if (chatId is not null && _sender is not null)
+            Log.Warn($"Прогрев OpenCode не удался: {ex.Message}");
+        }
+    }
+
+    // ---------- updates ----------
+
+    /// <summary>
+    /// Колбэк Telegram не должен ждать выполнения команды: иначе одна долгая
+    /// операция блокирует приём всех следующих сообщений. Раскладываем апдейты
+    /// по очередям чатов, а сами очереди разбираем параллельно.
+    /// </summary>
+    private Task HandleUpdateAsync(ITelegramBotClient bot, Update update, CancellationToken ct)
+    {
+        var chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id ?? 0;
+        if (chatId == 0) return Task.CompletedTask;
+
+        var inbox = _inboxes.GetOrAdd(chatId, _ => new ChatInbox());
+        if (Interlocked.Exchange(ref inbox.Started, 1) == 0)
+            _ = Task.Run(() => ConsumeUpdatesAsync(inbox, ct), CancellationToken.None);
+
+        inbox.Writer.TryWrite(update);
+        return Task.CompletedTask;
+    }
+
+    private async Task ConsumeUpdatesAsync(ChatInbox inbox, CancellationToken ct)
+    {
+        try
+        {
+            await foreach (var update in inbox.Reader.ReadAllAsync(ct).ConfigureAwait(false))
             {
                 try
                 {
-                    await _sender.SendPlainAsync(Cid(chatId.Value), $"❌ {ex.Message}", null, ct)
-                        .ConfigureAwait(false);
+                    await ProcessUpdateAsync(update, ct).ConfigureAwait(false);
                 }
-                catch
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
                 {
-                    // ничего
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    await ReportUpdateErrorAsync(update, ex, ct).ConfigureAwait(false);
                 }
             }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            // Если цикл завершился не из-за остановки приложения, следующий апдейт
+            // поднимет нового потребителя и очередь не зависнет.
+            Interlocked.Exchange(ref inbox.Started, 0);
+        }
+    }
+
+    private async Task ProcessUpdateAsync(Update update, CancellationToken ct)
+    {
+        if (update.Type == UpdateType.Message && update.Message is { } message)
+            await OnMessageAsync(message, ct).ConfigureAwait(false);
+        else if (update.Type == UpdateType.CallbackQuery && update.CallbackQuery is { } callback)
+            await OnCallbackAsync(callback, ct).ConfigureAwait(false);
+    }
+
+    private async Task ReportUpdateErrorAsync(Update update, Exception ex, CancellationToken ct)
+    {
+        Log.Error($"Ошибка обработки {update.Type}", ex);
+        var chatId = update.Message?.Chat.Id ?? update.CallbackQuery?.Message?.Chat.Id;
+        if (chatId is null || _sender is null) return;
+
+        try
+        {
+            await _sender.SendPlainAsync(Cid(chatId.Value), $"❌ {ex.Message}", null, ct)
+                .ConfigureAwait(false);
+        }
+        catch
+        {
+            // ничего
         }
     }
 
@@ -202,12 +324,22 @@ public sealed class BotService
             text = StripMention(text);
         }
 
+        // «Печатает…» появляется сразу, не дожидаясь ответа команды или OpenCode.
+        _ = _sender!.SendTypingAsync(Cid(chatId), ChatAction.Typing, ct);
+
         var runtime = GetRuntime(chatId);
         runtime.UserId = userId;
 
         if (text.StartsWith('/'))
         {
             await HandleCommandAsync(runtime, text.Trim(), ct).ConfigureAwait(false);
+            return;
+        }
+
+        // Кнопки постоянной клавиатуры приходят обычным текстом.
+        if (BotMenus.TryParseReply(text, out var menuAction))
+        {
+            await ExecuteMenuActionAsync(runtime, menuAction, 0, ct).ConfigureAwait(false);
             return;
         }
 
@@ -672,7 +804,285 @@ public sealed class BotService
                 await _sender.EditHtmlAsync(Cid(chatId), callback.Message!.Id, "Отменено.", null, ct, force: true)
                     .ConfigureAwait(false);
             }
+            return;
         }
+
+        if (CallbackData.TryParseMenu(data, out var menuAction))
+        {
+            await HandleMenuCallbackAsync(callback, menuAction, chatId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (CallbackData.TryParseFiles(data, out var generation, out var filesToken))
+        {
+            await HandleFilesCallbackAsync(callback, generation, filesToken, chatId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (CallbackData.TryParseSession(data, out var sessionToken, out var sessionIndex))
+        {
+            await HandleSessionCallbackAsync(callback, sessionToken, sessionIndex, chatId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (CallbackData.TryParseAgent(data, out var agent))
+        {
+            await HandleAgentCallbackAsync(callback, agent, chatId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        await _sender!.AnswerCallbackAsync(callback.Id, "Кнопка устарела", true, ct).ConfigureAwait(false);
+    }
+
+    private async Task HandleMenuCallbackAsync(
+        CallbackQuery callback, string action, long chatId, CancellationToken ct)
+    {
+        var runtime = GetRuntime(chatId);
+        var messageId = callback.Message?.Id ?? 0;
+
+        var title = MenuActionTitle(action);
+        if (title is null)
+        {
+            await _sender!.AnswerCallbackAsync(callback.Id, "Кнопка устарела", true, ct).ConfigureAwait(false);
+            return;
+        }
+
+        await _sender!.AnswerCallbackAsync(callback.Id, title, false, ct).ConfigureAwait(false);
+        await ExecuteMenuActionAsync(runtime, action, messageId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Общая обработка действий меню: и для inline-кнопок, и для нижней клавиатуры.</summary>
+    private async Task ExecuteMenuActionAsync(
+        ChatRuntime runtime, string action, int messageId, CancellationToken ct)
+    {
+        switch (action)
+        {
+            case BotMenus.Actions.Main:
+                await CmdMenuAsync(runtime, messageId, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Files:
+                await OpenBrowserAsync(
+                    runtime,
+                    _state.Get(runtime.ChatId).Directory ?? _config.DefaultDirectory,
+                    "📂 <b>Файлы</b>\nВыбери папку или файл.",
+                    messageId,
+                    ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.New:
+                await OpenBrowserAsync(
+                    runtime,
+                    _state.Get(runtime.ChatId).Directory ?? _config.DefaultDirectory,
+                    "🆕 <b>Новая сессия</b>\nВыбери папку кнопками и нажми «Новая сессия здесь».",
+                    messageId,
+                    ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Sessions:
+                await ShowSessionsAsync(runtime, messageId, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Model:
+                await ShowModelsAsync(runtime, messageId, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Agent:
+                await ShowAgentsAsync(runtime, messageId, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Status:
+                await CmdStatusAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Screen:
+                await CmdScreenAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Diff:
+                await CmdDiffAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Cancel:
+                await CmdCancelAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Restart:
+                await CmdRestartAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Help:
+                await CmdHelpAsync(runtime, ct).ConfigureAwait(false);
+                break;
+
+            case BotMenus.Actions.Shutdown:
+                await CmdShutdownAsync(runtime, ct).ConfigureAwait(false);
+                break;
+        }
+    }
+
+    private static string? MenuActionTitle(string action) => action switch
+    {
+        BotMenus.Actions.Main => "Меню",
+        BotMenus.Actions.Files => "Файлы",
+        BotMenus.Actions.New => "Выбор папки",
+        BotMenus.Actions.Sessions => "Сессии",
+        BotMenus.Actions.Model => "Модели",
+        BotMenus.Actions.Agent => "Агент",
+        BotMenus.Actions.Status => "Статус",
+        BotMenus.Actions.Screen => "Скриншот",
+        BotMenus.Actions.Diff => "Diff",
+        BotMenus.Actions.Cancel => "Отмена",
+        BotMenus.Actions.Restart => "Перезапуск",
+        BotMenus.Actions.Help => "Справка",
+        BotMenus.Actions.Shutdown => "Выключение",
+        _ => null,
+    };
+
+    private async Task HandleFilesCallbackAsync(
+        CallbackQuery callback, int generation, string token, long chatId, CancellationToken ct)
+    {
+        var runtime = GetRuntime(chatId);
+        var messageId = callback.Message?.Id ?? 0;
+
+        if (!runtime.Browser.TryGet(generation, out var page))
+        {
+            await _sender!.AnswerCallbackAsync(callback.Id, "Список устарел — открой /ls заново", true, ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        if (token is "m")
+        {
+            await _sender!.AnswerCallbackAsync(callback.Id, "Меню", false, ct).ConfigureAwait(false);
+            await CmdMenuAsync(runtime, messageId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (token is "n")
+        {
+            if (page.Drives || string.IsNullOrWhiteSpace(page.Path))
+            {
+                await _sender!.AnswerCallbackAsync(callback.Id, "Сначала выбери папку", true, ct).ConfigureAwait(false);
+                return;
+            }
+
+            await _sender!.AnswerCallbackAsync(callback.Id, "Создаю сессию…", false, ct).ConfigureAwait(false);
+            await CreateSessionAtAsync(runtime, page.Path, messageId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (token.Length > 1 && token[0] == 'p' && int.TryParse(token.AsSpan(1), out var pageNumber))
+        {
+            if (pageNumber < 0 || pageNumber >= page.PageCount)
+            {
+                await _sender!.AnswerCallbackAsync(callback.Id, "Это крайняя страница", false, ct).ConfigureAwait(false);
+                return;
+            }
+
+            FileBrowser.SetPage(page, pageNumber);
+            await _sender!.AnswerCallbackAsync(callback.Id, $"Страница {pageNumber + 1}", false, ct)
+                .ConfigureAwait(false);
+            await ShowBrowserPageAsync(
+                runtime,
+                page,
+                "",
+                messageId,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (token.Length > 1 && token[0] == 'e' && int.TryParse(token.AsSpan(1), out var entryIndex))
+        {
+            if (entryIndex < 0 || entryIndex >= page.Entries.Count)
+            {
+                await _sender!.AnswerCallbackAsync(callback.Id, "Список устарел — открой /ls заново", true, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            var entry = page.Entries[entryIndex];
+            if (entry.IsDirectory)
+            {
+                await _sender!.AnswerCallbackAsync(callback.Id, entry.Name, false, ct).ConfigureAwait(false);
+                try
+                {
+                    await OpenBrowserAsync(
+                        runtime,
+                        entry.FullPath,
+                        "",
+                        messageId,
+                        ct).ConfigureAwait(false);
+                }
+                catch (DirectoryNotFoundException ex)
+                {
+                    await _sender.SendPlainAsync(Cid(chatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+                }
+                return;
+            }
+
+            await _sender!.AnswerCallbackAsync(callback.Id, "Отправляю файл…", false, ct).ConfigureAwait(false);
+            _ = Task.Run(() => SendFileByPathAsync(chatId, entry.FullPath, ct), CancellationToken.None);
+            return;
+        }
+
+        await _sender!.AnswerCallbackAsync(callback.Id, "Обновляю", false, ct).ConfigureAwait(false);
+
+        var target = token switch
+        {
+            "u" => FileBrowser.ParentOf(page.Path),
+            "r" => null,
+            "h" => FileBrowser.HomeDirectory,
+            "c" => _state.Get(chatId).Directory ?? _config.DefaultDirectory,
+            "R" => page.Drives ? null : page.Path,
+            _ => page.Drives ? null : page.Path,
+        };
+
+        await OpenBrowserAsync(
+            runtime,
+            target,
+            "",
+            messageId,
+            ct).ConfigureAwait(false);
+    }
+
+    private async Task HandleSessionCallbackAsync(
+        CallbackQuery callback, int token, int index, long chatId, CancellationToken ct)
+    {
+        var runtime = GetRuntime(chatId);
+        if (!runtime.TryGetSessions(token, out var sessions) || index < 0 || index >= sessions.Count)
+        {
+            await _sender!.AnswerCallbackAsync(callback.Id, "Список устарел, открой /sessions", true, ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var chosen = sessions[index];
+        await _sender!.AnswerCallbackAsync(callback.Id, "Переключаюсь…", false, ct).ConfigureAwait(false);
+
+        var session = await _client.GetSessionAsync(chosen.Id, ct).ConfigureAwait(false);
+        if (session is null)
+        {
+            await _sender.SendPlainAsync(Cid(chatId), "Сессия не найдена.", null, ct).ConfigureAwait(false);
+            return;
+        }
+
+        var messageId = callback.Message?.Id ?? 0;
+        await SwitchSessionAsync(runtime, session, messageId, ct).ConfigureAwait(false);
+    }
+
+    private async Task HandleAgentCallbackAsync(
+        CallbackQuery callback, string agent, long chatId, CancellationToken ct)
+    {
+        if (agent is not ("build" or "plan"))
+        {
+            await _sender!.AnswerCallbackAsync(callback.Id, "Такой агент недоступен", true, ct).ConfigureAwait(false);
+            return;
+        }
+
+        var runtime = GetRuntime(chatId);
+        await _sender!.AnswerCallbackAsync(callback.Id, $"Агент: {agent}", false, ct).ConfigureAwait(false);
+        await ApplyAgentAsync(runtime, agent, callback.Message?.Id ?? 0, ct).ConfigureAwait(false);
     }
 
     private async Task HandleApprovalCallbackAsync(
@@ -734,13 +1144,14 @@ public sealed class BotService
         }
 
         var model = runtime.LastModels[index];
-        await ApplyModelAsync(runtime, model, ct).ConfigureAwait(false);
         await _sender!.AnswerCallbackAsync(callback.Id, $"Модель: {model.Name}", false, ct).ConfigureAwait(false);
+
+        await ApplyModelAsync(runtime, model, ct).ConfigureAwait(false);
         await _sender.EditHtmlAsync(
             Cid(chatId),
             callback.Message!.Id,
             $"🧠 Модель переключена: <code>{TextUtil.EscapeHtml(model.ProviderID + "/" + model.Id)}</code>",
-            null,
+            BotMenus.MenuOnly(),
             ct,
             force: true).ConfigureAwait(false);
     }
@@ -760,6 +1171,9 @@ public sealed class BotService
         {
             case "/start":
                 await CmdStartAsync(runtime, ct).ConfigureAwait(false);
+                break;
+            case "/menu":
+                await CmdMenuAsync(runtime, 0, ct).ConfigureAwait(false);
                 break;
             case "/help":
                 await CmdHelpAsync(runtime, ct).ConfigureAwait(false);
@@ -827,13 +1241,32 @@ public sealed class BotService
             $"📁 Папка: <code>{TextUtil.EscapeHtml(chat.Directory ?? _config.DefaultDirectory)}</code>\n" +
             $"🧠 Модель: <code>{TextUtil.EscapeHtml((chat.ModelProvider ?? _config.Model.ProviderID) + "/" + (chat.ModelID ?? _config.Model.ID))}</code>\n" +
             $"🤖 Агент: <code>{TextUtil.EscapeHtml(chat.Agent ?? _config.Agent)}</code>\n\n" +
-            "Напиши задачу обычным текстом. " +
+            "Кнопки меню теперь всегда внизу — писать команды не нужно.\n" +
+            "Напиши задачу обычным текстом или выбери действие кнопкой. " +
             (_config.AutoApprove
                 ? "Подтверждения отключены — всё выполняется сразу.\n"
-                : "Опасные действия придут с кнопками.\n") +
-            "/help — все команды.";
+                : "Опасные действия придут с кнопками.\n");
 
-        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, null, ct).ConfigureAwait(false);
+        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, BotMenus.ReplyMenu(), ct).ConfigureAwait(false);
+    }
+
+    private async Task CmdMenuAsync(ChatRuntime runtime, int messageId, CancellationToken ct)
+    {
+        var chat = _state.Get(runtime.ChatId);
+        var busy = Volatile.Read(ref runtime.Busy) == 1;
+        int queued;
+        lock (runtime.QueueSync) queued = runtime.Queue.Count;
+
+        var text = BotMenus.MainText(chat, _config, busy, queued);
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.MainMenu(), ct, force: true).ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, BotMenus.MainMenu(), ct).ConfigureAwait(false);
+        }
     }
 
     private async Task CmdHelpAsync(ChatRuntime runtime, CancellationToken ct)
@@ -849,9 +1282,11 @@ public sealed class BotService
         var text =
             "<b>Remoter</b> — мост к OpenCode на этом ПК.\n\n" +
             "Просто напиши задачу: агент прочитает код, что-то поменяет и запустит.\n" +
+            "Или пользуйся кнопками — писать команды с телефона не обязательно.\n" +
             approvalLine + "\n\n" +
             "<b>Команды</b>\n" +
-            "/new [путь] — новая сессия\n" +
+            "/menu — меню с кнопками\n" +
+            "/new [путь] — новая сессия (без пути — выбор папки кнопками)\n" +
             "/sessions — последние сессии\n" +
             "/use N — переключиться на сессию\n" +
             "/status — что происходит сейчас\n" +
@@ -860,21 +1295,36 @@ public sealed class BotService
             "/model [имя] — выбор модели\n" +
             "/screen — скриншот экрана\n" +
             "/file путь — прислать файл\n" +
-            "/ls [путь] — содержимое папки\n" +
+            "/ls [путь] — файлы и папки кнопками\n" +
             "/diff — изменения текущей сессии\n" +
             "/restart — перезапуск сервиса OpenCode\n" +
             "/shutdown — выключить бота\n\n" + footer;
 
-        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, null, ct).ConfigureAwait(false);
+        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, BotMenus.MainMenu(), ct).ConfigureAwait(false);
     }
 
     private async Task CmdNewAsync(ChatRuntime runtime, string arg, CancellationToken ct)
     {
         var chat = _state.Get(runtime.ChatId);
-        var directory = string.IsNullOrWhiteSpace(arg)
-            ? chat.Directory ?? _config.DefaultDirectory
-            : AppConfig.ExpandPath(arg.Trim('"'));
 
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            await OpenBrowserAsync(
+                runtime,
+                chat.Directory ?? _config.DefaultDirectory,
+                "🆕 <b>Новая сессия</b>\nВыбери папку кнопками и нажми «Новая сессия здесь».",
+                0,
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        var directory = AppConfig.ExpandPath(arg.Trim('"'));
+        await CreateSessionAtAsync(runtime, directory, 0, ct).ConfigureAwait(false);
+    }
+
+    private async Task CreateSessionAtAsync(
+        ChatRuntime runtime, string directory, int messageId, CancellationToken ct)
+    {
         if (!Directory.Exists(directory))
         {
             await _sender!.SendPlainAsync(
@@ -882,6 +1332,7 @@ public sealed class BotService
             return;
         }
 
+        var chat = _state.Get(runtime.ChatId);
         var model = new ModelRef
         {
             Id = chat.ModelID ?? _config.Model.ID,
@@ -897,47 +1348,107 @@ public sealed class BotService
         {
             s.SessionID = session.Id;
             s.Directory = directory;
+            s.ModelID = model.Id;
+            s.ModelProvider = model.ProviderID;
+            s.Agent = agent;
         });
 
         MapSession(session.Id, runtime.ChatId);
 
-        await _sender!.SendHtmlAsync(
-            Cid(runtime.ChatId),
+        var text =
             $"🆕 <b>Новая сессия</b>\n" +
             $"📁 <code>{TextUtil.EscapeHtml(directory)}</code>\n" +
             $"🧠 <code>{TextUtil.EscapeHtml(model.ProviderID + "/" + model.Id)}</code>\n" +
             $"🤖 <code>{TextUtil.EscapeHtml(agent)}</code>\n" +
-            $"🆔 <code>{session.Id}</code>",
-            null,
-            ct).ConfigureAwait(false);
+            $"🆔 <code>{session.Id}</code>";
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.MenuOnly(), ct, force: true).ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId), text, BotMenus.MenuOnly(), ct).ConfigureAwait(false);
+        }
     }
 
-    private async Task CmdSessionsAsync(ChatRuntime runtime, CancellationToken ct)
+    private async Task CmdSessionsAsync(ChatRuntime runtime, CancellationToken ct) =>
+        await ShowSessionsAsync(runtime, 0, ct).ConfigureAwait(false);
+
+    private async Task ShowSessionsAsync(ChatRuntime runtime, int messageId, CancellationToken ct)
     {
         var list = (await _client.ListSessionsAsync(15, ct).ConfigureAwait(false)).ToList();
+        var token = runtime.StoreSessions(list);
         runtime.LastSessions = list;
+
+        var chat = _state.Get(runtime.ChatId);
+        var current = chat.SessionID;
 
         if (list.Count == 0)
         {
-            await _sender!.SendPlainAsync(Cid(runtime.ChatId), "Сессий пока нет.", null, ct)
-                .ConfigureAwait(false);
+            if (messageId > 0)
+            {
+                await _sender!.EditHtmlAsync(
+                    Cid(runtime.ChatId),
+                    messageId,
+                    "🗂 Сессий пока нет. Напиши задачу — сессия создастся сама.",
+                    BotMenus.MenuOnly(),
+                    ct,
+                    force: true).ConfigureAwait(false);
+            }
+            else
+            {
+                await _sender!.SendPlainAsync(
+                    Cid(runtime.ChatId), "Сессий пока нет.", BotMenus.MenuOnly(), ct).ConfigureAwait(false);
+            }
             return;
         }
 
-        var current = _state.Get(runtime.ChatId).SessionID;
-        var sb = new StringBuilder("🗂 <b>Последние сессии</b>\n\n");
+        var header = new StringBuilder("🗂 <b>Последние сессии</b>\n");
+        var currentTitle = list.FirstOrDefault(s => s.Id == current)?.Title;
+        if (!string.IsNullOrWhiteSpace(currentTitle))
+            header.Append("Сейчас: <b>").Append(TextUtil.EscapeHtml(TextUtil.Truncate(currentTitle!, 60))).Append("</b>\n");
+        header.Append("\nНажми на кнопку, чтобы переключиться.");
 
+        var rows = new List<InlineKeyboardButton[]>(list.Count + 1);
         for (var i = 0; i < list.Count; i++)
         {
             var session = list[i];
-            var title = string.IsNullOrWhiteSpace(session.Title) ? "(без названия)" : session.Title!;
-            var marker = session.Id == current ? " ←" : "";
-            sb.Append($"{i + 1}. {TextUtil.EscapeHtml(TextUtil.Truncate(title, 50))}{marker}\n");
-            sb.Append($"   <code>{TextUtil.EscapeHtml(TextUtil.Truncate(session.Location?.Directory ?? "", 70))}</code>\n");
-        }
+            var title = string.IsNullOrWhiteSpace(session.Title)
+                ? Path.GetFileName(session.Location?.Directory?.TrimEnd('\\', '/') ?? "")
+                : session.Title!;
+            if (string.IsNullOrWhiteSpace(title)) title = "без названия";
 
-        sb.Append("\n/use N — переключиться");
-        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), sb.ToString(), null, ct).ConfigureAwait(false);
+            var marker = session.Id == current ? "✅ " : "";
+            rows.Add(
+            [
+                InlineKeyboardButton.WithCallbackData(
+                    $"{marker}{i + 1}. {TextUtil.Truncate(title, 48)}",
+                    CallbackData.Session(token, i)),
+            ]);
+        }
+        rows.Add(BotMenus.MenuRow());
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId),
+                messageId,
+                header.ToString(),
+                new InlineKeyboardMarkup(rows),
+                ct,
+                force: true).ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId),
+                header.ToString(),
+                new InlineKeyboardMarkup(rows),
+                ct).ConfigureAwait(false);
+        }
     }
 
     private async Task CmdUseAsync(ChatRuntime runtime, string arg, CancellationToken ct)
@@ -960,6 +1471,12 @@ public sealed class BotService
             return;
         }
 
+        await SwitchSessionAsync(runtime, session, 0, ct).ConfigureAwait(false);
+    }
+
+    private async Task SwitchSessionAsync(
+        ChatRuntime runtime, SessionInfo session, int messageId, CancellationToken ct)
+    {
         _state.Update(runtime.ChatId, s =>
         {
             s.SessionID = session.Id;
@@ -971,13 +1488,21 @@ public sealed class BotService
 
         MapSession(session.Id, runtime.ChatId);
 
-        await _sender!.SendHtmlAsync(
-            Cid(runtime.ChatId),
+        var text =
             $"🔀 Переключился\n" +
             $"📁 <code>{TextUtil.EscapeHtml(session.Location?.Directory ?? "")}</code>\n" +
-            $"🧠 <code>{TextUtil.EscapeHtml((session.Model?.ProviderID ?? "") + "/" + (session.Model?.Id ?? ""))}</code>",
-            null,
-            ct).ConfigureAwait(false);
+            $"🧠 <code>{TextUtil.EscapeHtml((session.Model?.ProviderID ?? "") + "/" + (session.Model?.Id ?? ""))}</code>";
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.MenuOnly(), ct, force: true).ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId), text, BotMenus.MenuOnly(), ct).ConfigureAwait(false);
+        }
     }
 
     private async Task CmdStatusAsync(ChatRuntime runtime, CancellationToken ct)
@@ -1064,25 +1589,9 @@ public sealed class BotService
 
     private async Task CmdAgentAsync(ChatRuntime runtime, string arg, CancellationToken ct)
     {
-        var chat = _state.Get(runtime.ChatId);
-        var current = chat.Agent ?? _config.Agent;
-
         if (string.IsNullOrWhiteSpace(arg))
         {
-            var agents = await _client.ListAgentsAsync(ct).ConfigureAwait(false);
-            var available = agents
-                .Where(a => a.Mode == "primary" && a.Id is "build" or "plan")
-                .Select(a => a.Id)
-                .ToArray();
-
-            await _sender!.SendHtmlAsync(
-                Cid(runtime.ChatId),
-                $"🤖 Текущий агент: <code>{TextUtil.EscapeHtml(current)}</code>\n\n" +
-                "/agent build — выполнять задачи\n" +
-                "/agent plan — только планировать, без изменений\n\n" +
-                $"Доступно: <code>{TextUtil.EscapeHtml(string.Join(", ", available))}</code>",
-                null,
-                ct).ConfigureAwait(false);
+            await ShowAgentsAsync(runtime, 0, ct).ConfigureAwait(false);
             return;
         }
 
@@ -1093,6 +1602,34 @@ public sealed class BotService
                 Cid(runtime.ChatId), "Доступны только build и plan.", null, ct).ConfigureAwait(false);
             return;
         }
+
+        await ApplyAgentAsync(runtime, name, 0, ct).ConfigureAwait(false);
+    }
+
+    private async Task ShowAgentsAsync(ChatRuntime runtime, int messageId, CancellationToken ct)
+    {
+        var chat = _state.Get(runtime.ChatId);
+        var current = chat.Agent ?? _config.Agent;
+        var text = $"🤖 <b>Режим агента</b>\n\nСейчас: <code>{TextUtil.EscapeHtml(current)}</code>\n\n" +
+                   "build — выполнять задачи и менять файлы\n" +
+                   "plan — только планировать, без изменений";
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.Agents(current), ct, force: true)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId), text, BotMenus.Agents(current), ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task ApplyAgentAsync(ChatRuntime runtime, string name, int messageId, CancellationToken ct)
+    {
+        var chat = _state.Get(runtime.ChatId);
 
         if (!string.IsNullOrWhiteSpace(chat.SessionID))
         {
@@ -1108,46 +1645,25 @@ public sealed class BotService
 
         _state.Update(runtime.ChatId, s => s.Agent = name);
 
-        await _sender!.SendHtmlAsync(
-            Cid(runtime.ChatId), $"🤖 Агент: <code>{name}</code>", null, ct).ConfigureAwait(false);
+        var text = $"🤖 Агент: <code>{TextUtil.EscapeHtml(name)}</code>";
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.MenuOnly(), ct, force: true)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId), text, BotMenus.MenuOnly(), ct).ConfigureAwait(false);
+        }
     }
 
     private async Task CmdModelAsync(ChatRuntime runtime, string arg, CancellationToken ct)
     {
-        var chat = _state.Get(runtime.ChatId);
-        var current = (chat.ModelProvider ?? _config.Model.ProviderID) + "/" + (chat.ModelID ?? _config.Model.ID);
-
         if (string.IsNullOrWhiteSpace(arg))
         {
-            var all = await _client.ListModelsAsync(ct).ConfigureAwait(false);
-            var list = all
-                .Where(m => string.IsNullOrEmpty(m.Status) || m.Status == "active")
-                .Take(12)
-                .ToList();
-
-            runtime.LastModels = list;
-
-            if (list.Count == 0)
-            {
-                await _sender!.SendPlainAsync(Cid(runtime.ChatId), "Модели не найдены.", null, ct)
-                    .ConfigureAwait(false);
-                return;
-            }
-
-            var buttons = list
-                .Select((model, index) => new[]
-                {
-                    InlineKeyboardButton.WithCallbackData(
-                        $"{index + 1}. {TextUtil.Truncate(string.IsNullOrWhiteSpace(model.Name) ? model.Id : model.Name, 40)}",
-                        CallbackData.Model(index)),
-                })
-                .ToArray();
-
-            await _sender!.SendHtmlAsync(
-                Cid(runtime.ChatId),
-                $"🧠 Сейчас: <code>{TextUtil.EscapeHtml(current)}</code>\n\nВыбери модель:",
-                new InlineKeyboardMarkup(buttons),
-                ct).ConfigureAwait(false);
+            await ShowModelsAsync(runtime, 0, ct).ConfigureAwait(false);
             return;
         }
 
@@ -1167,6 +1683,46 @@ public sealed class BotService
         }
 
         await ApplyModelAsync(runtime, match, ct).ConfigureAwait(false);
+        await _sender!.SendHtmlAsync(
+            Cid(runtime.ChatId),
+            $"🧠 Модель: <code>{TextUtil.EscapeHtml(match.ProviderID + "/" + match.Id)}</code>",
+            BotMenus.MenuOnly(),
+            ct).ConfigureAwait(false);
+    }
+
+    private async Task ShowModelsAsync(ChatRuntime runtime, int messageId, CancellationToken ct)
+    {
+        var chat = _state.Get(runtime.ChatId);
+        var current = (chat.ModelProvider ?? _config.Model.ProviderID) + "/" + (chat.ModelID ?? _config.Model.ID);
+
+        var all = await _client.ListModelsAsync(ct).ConfigureAwait(false);
+        var list = all
+            .Where(m => string.IsNullOrEmpty(m.Status) || m.Status == "active")
+            .Take(12)
+            .ToList();
+
+        runtime.LastModels = list;
+
+        if (list.Count == 0)
+        {
+            await _sender!.SendPlainAsync(Cid(runtime.ChatId), "Модели не найдены.", null, ct)
+                .ConfigureAwait(false);
+            return;
+        }
+
+        var text = $"🧠 <b>Модель</b>\n\nСейчас: <code>{TextUtil.EscapeHtml(current)}</code>\n\nВыбери модель:";
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, BotMenus.Models(list), ct, force: true)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(
+                Cid(runtime.ChatId), text, BotMenus.Models(list), ct).ConfigureAwait(false);
+        }
     }
 
     private async Task ApplyModelAsync(ChatRuntime runtime, ModelInfo model, CancellationToken ct)
@@ -1183,15 +1739,15 @@ public sealed class BotService
             s.ModelID = model.Id;
             s.ModelProvider = model.ProviderID;
         });
-
-        await _sender!.SendHtmlAsync(
-            Cid(runtime.ChatId),
-            $"🧠 Модель: <code>{TextUtil.EscapeHtml(model.ProviderID + "/" + model.Id)}</code>",
-            null,
-            ct).ConfigureAwait(false);
     }
 
-    private async Task CmdScreenAsync(ChatRuntime runtime, CancellationToken ct)
+    private Task CmdScreenAsync(ChatRuntime runtime, CancellationToken ct)
+    {
+        _ = Task.Run(() => CaptureAndSendScreenAsync(runtime.ChatId, ct), CancellationToken.None);
+        return Task.CompletedTask;
+    }
+
+    private async Task CaptureAndSendScreenAsync(long chatId, CancellationToken ct)
     {
         string? path = null;
         try
@@ -1199,12 +1755,21 @@ public sealed class BotService
             var shot = await ScreenshotService.CaptureAsync(ct).ConfigureAwait(false);
             path = shot.Path;
             await _sender!.SendPhotoAsync(
-                Cid(runtime.ChatId), path, $"🖥 {shot.Width}×{shot.Height}", ct).ConfigureAwait(false);
+                Cid(chatId), path, $"🖥 {shot.Width}×{shot.Height}", ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
-            await _sender!.SendPlainAsync(
-                Cid(runtime.ChatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+            try
+            {
+                await _sender!.SendPlainAsync(Cid(chatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ничего
+            }
         }
         finally
         {
@@ -1243,14 +1808,56 @@ public sealed class BotService
             return;
         }
 
-        var extension = info.Extension.ToLowerInvariant();
-        var isImage = extension is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".webp";
-        var caption = $"{info.Name} — {TextUtil.HumanBytes(info.Length)}";
+        // Отправка файла может занять десятки секунд — не держим очередь команд.
+        _ = Task.Run(() => SendFileByPathAsync(runtime.ChatId, path, ct), CancellationToken.None);
+    }
 
-        if (isImage)
-            await _sender!.SendPhotoAsync(Cid(runtime.ChatId), path, caption, ct).ConfigureAwait(false);
-        else
-            await _sender!.SendDocumentAsync(Cid(runtime.ChatId), path, caption, ct).ConfigureAwait(false);
+    private async Task SendFileByPathAsync(long chatId, string path, CancellationToken ct)
+    {
+        try
+        {
+            var info = new FileInfo(path);
+            if (!info.Exists)
+            {
+                await _sender!.SendPlainAsync(Cid(chatId), $"❌ Файл не найден: {path}", null, ct)
+                    .ConfigureAwait(false);
+                return;
+            }
+
+            if (info.Length > _config.MaxTelegramDocumentBytes)
+            {
+                await _sender!.SendPlainAsync(
+                    Cid(chatId),
+                    $"❌ Файл слишком большой: {TextUtil.HumanBytes(info.Length)}.",
+                    null,
+                    ct).ConfigureAwait(false);
+                return;
+            }
+
+            var extension = info.Extension.ToLowerInvariant();
+            var isImage = extension is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".webp";
+            var caption = $"{info.Name} — {TextUtil.HumanBytes(info.Length)}";
+
+            if (isImage)
+                await _sender!.SendPhotoAsync(Cid(chatId), path, caption, ct).ConfigureAwait(false);
+            else
+                await _sender!.SendDocumentAsync(Cid(chatId), path, caption, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"Не удалось отправить файл {path}: {ex.Message}");
+            try
+            {
+                await _sender!.SendPlainAsync(Cid(chatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ничего
+            }
+        }
     }
 
     private async Task CmdListAsync(ChatRuntime runtime, string arg, CancellationToken ct)
@@ -1260,33 +1867,52 @@ public sealed class BotService
             ? chat.Directory ?? _config.DefaultDirectory
             : AppConfig.ExpandPath(arg.Trim('"'));
 
-        if (!Directory.Exists(path))
+        if (File.Exists(path))
         {
-            await _sender!.SendPlainAsync(Cid(runtime.ChatId), $"❌ Папка не найдена: {path}", null, ct)
-                .ConfigureAwait(false);
+            // Отправка файла не должна задерживать следующие команды чата.
+            _ = Task.Run(() => SendFileByPathAsync(runtime.ChatId, path, ct), CancellationToken.None);
             return;
         }
 
-        var entries = new DirectoryInfo(path)
-            .EnumerateFileSystemInfos()
-            .OrderByDescending(e => e is DirectoryInfo)
-            .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
-            .Take(60)
-            .ToList();
+        await OpenBrowserAsync(
+            runtime,
+            path,
+            "📂 <b>Файлы</b>\nВыбери папку или файл.",
+            0,
+            ct).ConfigureAwait(false);
+    }
 
-        var sb = new StringBuilder($"📂 <code>{TextUtil.EscapeHtml(path)}</code>\n\n");
-        foreach (var entry in entries)
+    private async Task OpenBrowserAsync(
+        ChatRuntime runtime, string? path, string intro, int messageId, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(path) && !Directory.Exists(path))
         {
-            if (entry is DirectoryInfo)
-                sb.Append("📁 ").Append(TextUtil.EscapeHtml(entry.Name)).Append('\n');
-            else if (entry is FileInfo file)
-                sb.Append("📄 ").Append(TextUtil.EscapeHtml(file.Name))
-                  .Append(" <i>").Append(TextUtil.HumanBytes(file.Length)).Append("</i>\n");
+            await _sender!.SendPlainAsync(
+                Cid(runtime.ChatId), $"❌ Папка не найдена: {path}", null, ct).ConfigureAwait(false);
+            return;
         }
 
-        if (entries.Count == 0) sb.Append("<i>пусто</i>");
+        var page = runtime.Browser.Open(string.IsNullOrWhiteSpace(path) ? null : path);
+        await ShowBrowserPageAsync(runtime, page, intro, messageId, ct).ConfigureAwait(false);
+    }
 
-        await _sender!.SendHtmlAsync(Cid(runtime.ChatId), sb.ToString(), null, ct).ConfigureAwait(false);
+    private async Task ShowBrowserPageAsync(
+        ChatRuntime runtime, BrowserPage page, string intro, int messageId, CancellationToken ct)
+    {
+        var chat = _state.Get(runtime.ChatId);
+        var browserText = BotMenus.BrowserText(page, chat.Directory);
+        var text = string.IsNullOrWhiteSpace(intro) ? browserText : intro + "\n\n" + browserText;
+        var keyboard = BotMenus.Browser(page, chat.Directory);
+
+        if (messageId > 0)
+        {
+            await _sender!.EditHtmlAsync(
+                Cid(runtime.ChatId), messageId, text, keyboard, ct, force: true).ConfigureAwait(false);
+        }
+        else
+        {
+            await _sender!.SendHtmlAsync(Cid(runtime.ChatId), text, keyboard, ct).ConfigureAwait(false);
+        }
     }
 
     private async Task CmdDiffAsync(ChatRuntime runtime, CancellationToken ct)
@@ -1338,6 +1964,11 @@ public sealed class BotService
         await _sender!.SendPlainAsync(Cid(runtime.ChatId), "🔄 Перезапускаю сервис OpenCode…", null, ct)
             .ConfigureAwait(false);
 
+        _ = Task.Run(() => RestartServiceAsync(runtime.ChatId, ct), CancellationToken.None);
+    }
+
+    private async Task RestartServiceAsync(long chatId, CancellationToken ct)
+    {
         try
         {
             var info = new ProcessStartInfo
@@ -1361,32 +1992,35 @@ public sealed class BotService
             _client.Reconnect();
 
             var text = string.IsNullOrWhiteSpace(error) ? output.Trim() : error.Trim();
-            await _sender.SendHtmlAsync(
-                Cid(runtime.ChatId),
+            await _sender!.SendHtmlAsync(
+                Cid(chatId),
                 "✅ Сервис перезапущен\n<pre>" + TextUtil.EscapeHtml(TextUtil.Truncate(text, 500)) + "</pre>",
-                null,
+                BotMenus.MenuOnly(),
                 ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
         }
         catch (Exception ex)
         {
-            await _sender!.SendPlainAsync(Cid(runtime.ChatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+            Log.Warn($"Не удалось перезапустить OpenCode: {ex.Message}");
+            try
+            {
+                await _sender!.SendPlainAsync(Cid(chatId), $"❌ {ex.Message}", null, ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                // ничего
+            }
         }
     }
 
     private async Task CmdShutdownAsync(ChatRuntime runtime, CancellationToken ct)
     {
-        var keyboard = new InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton.WithCallbackData("Да, выключить", CallbackData.ShutdownYes),
-                InlineKeyboardButton.WithCallbackData("Отмена", CallbackData.ShutdownNo),
-            ],
-        ]);
-
         await _sender!.SendHtmlAsync(
             Cid(runtime.ChatId),
             "Выключить Remoter? Бот перестанет отвечать до следующего запуска.",
-            keyboard,
+            BotMenus.ShutdownConfirm(),
             ct).ConfigureAwait(false);
     }
 
@@ -1403,5 +2037,16 @@ public sealed class BotService
         return element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
+    }
+
+    /// <summary>Очередь апдейтов одного чата: команды обрабатываются по порядку, но не блокируют polling.</summary>
+    private sealed class ChatInbox
+    {
+        public Channel<Update> Updates { get; } = Channel.CreateUnbounded<Update>(
+            new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+
+        public ChannelReader<Update> Reader => Updates.Reader;
+        public ChannelWriter<Update> Writer => Updates.Writer;
+        public int Started;
     }
 }
